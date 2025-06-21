@@ -4,6 +4,7 @@
  *              包括清理文本、向 TTS API 发送请求、处理响应以及管理消息中的播放控件 UI。
  *              现在实现了 TTS 音频的 IndexedDB 缓存。
  *              更新：cleanTextForTts 现在仅保留中日韩字符、拉丁字母、数字、中英文逗号句号，其他标点替换为英文逗号。
+ *              修复：TTS 音频现在转换为 Base64 Data URL 存储在页面上，以提高播放可靠性。
  * @module MessageTtsHandler
  * @exports {object} MessageTtsHandler - 对外暴露的单例对象，包含所有 TTS 相关处理方法。
  * @property {function} requestTtsForMessage - 为指定消息文本请求 TTS 音频。
@@ -139,6 +140,29 @@ const MessageTtsHandler = {
     },
 
     /**
+     * @private
+     * 处理音频 Blob，将其转换为 base64 Data URL 并更新 UI。
+     * @param {Blob} audioBlob - 要处理的音频 Blob。
+     * @param {HTMLElement} parentContainer - 消息内容的父容器元素。
+     * @param {string} ttsId - 与此 TTS 请求关联的唯一 ID。
+     * @param {string} cacheKeyInfo - 用于日志记录的缓存键信息。
+     * @param {boolean} isFromCache - 指示 Blob 是否来自缓存。
+     */
+    _processAudioBlobForUi: function(audioBlob, parentContainer, ttsId, cacheKeyInfo, isFromCache) {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+            const base64DataUrl = reader.result;
+            Utils.log(`MessageTtsHandler: ttsId ${ttsId} (CacheKey: ${cacheKeyInfo}, FromCache: ${isFromCache}) 的 TTS 音频已转换为 base64。`, Utils.logLevels.DEBUG);
+            this.updateTtsControlToPlay(parentContainer, ttsId, base64DataUrl);
+        };
+        reader.onerror = (err) => {
+            Utils.log(`MessageTtsHandler: ttsId ${ttsId} (CacheKey: ${cacheKeyInfo}) 转换 Blob 到 base64 失败: ${err}`, Utils.logLevels.ERROR);
+            this.updateTtsControlToError(parentContainer, ttsId, "音频转换失败");
+        };
+        reader.readAsDataURL(audioBlob);
+    },
+
+    /**
      * 为指定消息文本请求 TTS 音频。
      * @param {string} text - 清理后的消息文本。
      * @param {object} ttsConfig - 该 AI 角色的 TTS 配置。
@@ -185,8 +209,7 @@ const MessageTtsHandler = {
             const cachedItem = await DBManager.getItem(this._TTS_CACHE_STORE_NAME, cacheKey);
             if (cachedItem && cachedItem.audioBlob instanceof Blob && cachedItem.audioBlob.size > 0) {
                 Utils.log(`TTS Cache HIT for key ${cacheKey} (ttsId ${ttsId}). Using cached audio.`, Utils.logLevels.INFO);
-                const preloadedAudioObjectURL = URL.createObjectURL(cachedItem.audioBlob);
-                this.updateTtsControlToPlay(parentContainer, ttsId, preloadedAudioObjectURL);
+                this._processAudioBlobForUi(cachedItem.audioBlob, parentContainer, ttsId, cacheKey, true);
                 return;
             }
             Utils.log(`TTS Cache MISS for key ${cacheKey} (ttsId ${ttsId}). Fetching from API.`, Utils.logLevels.DEBUG);
@@ -225,10 +248,8 @@ const MessageTtsHandler = {
                 Utils.log(`MessageTtsHandler: Caching audio blob for key ${cacheKey} (ttsId ${ttsId}), size: ${audioBlob.size}`, Utils.logLevels.DEBUG);
                 await DBManager.setItem(this._TTS_CACHE_STORE_NAME, { id: cacheKey, audioBlob: audioBlob });
 
-                // 5. Update UI
-                const preloadedAudioObjectURL = URL.createObjectURL(audioBlob);
-                Utils.log(`MessageTtsHandler: ttsId ${ttsId} 的 TTS 音频已获取并缓存。Object URL: ${preloadedAudioObjectURL}`, Utils.logLevels.DEBUG);
-                this.updateTtsControlToPlay(parentContainer, ttsId, preloadedAudioObjectURL);
+                // 5. Process blob for UI (convert to base64 and update)
+                this._processAudioBlobForUi(audioBlob, parentContainer, ttsId, cacheKey, false);
 
             } else {
                 throw new Error(`TTS API 响应缺少 audio_url。消息: ${result.msg || '未知错误'}`);
@@ -240,21 +261,19 @@ const MessageTtsHandler = {
         }
     },
 
-    // _preloadAndSetAudio method is removed as its logic is integrated into requestTtsForMessage
-
     /**
      * 将 TTS 控件更新为播放按钮。
      * @param {HTMLElement} parentContainer - 消息内容的父容器元素。
      * @param {string} ttsId - 关联的 TTS ID。
-     * @param {string} audioUrl - 预加载的音频 Object URL。
+     * @param {string} audioBase64Url - 预加载的音频 Base64 Data URL。
      */
-    updateTtsControlToPlay: function (parentContainer, ttsId, audioUrl) {
+    updateTtsControlToPlay: function (parentContainer, ttsId, audioBase64Url) {
         const ttsControlContainer = parentContainer.querySelector(`.tts-control-container[data-tts-id="${ttsId}"]`);
         if (ttsControlContainer) {
             ttsControlContainer.innerHTML = '';
             const playButton = document.createElement('button');
             playButton.className = 'tts-play-button';
-            playButton.dataset.audioUrl = audioUrl;
+            playButton.dataset.audioUrl = audioBase64Url; // Store base64 data URL
             playButton.title = "播放/暂停语音";
             playButton.addEventListener('click', (e) => {
                 e.stopPropagation();
@@ -269,16 +288,12 @@ const MessageTtsHandler = {
      * @param {HTMLElement} buttonElement - 被点击的播放按钮。
      */
     playTtsAudioFromControl: function (buttonElement) {
-        const audioUrl = buttonElement.dataset.audioUrl;
+        const audioUrl = buttonElement.dataset.audioUrl; // This is now a base64 Data URL
         if (!audioUrl) return;
 
-        const revokeCurrentAudioObjectURL = (audioInstance) => {
-            if (audioInstance && audioInstance.src && audioInstance.src.startsWith('blob:') && audioInstance.dataset.managedObjectURL === 'true') {
-                URL.revokeObjectURL(audioInstance.src);
-                Utils.log(`已撤销 object URL: ${audioInstance.src}`, Utils.logLevels.DEBUG);
-                delete audioInstance.dataset.managedObjectURL;
-            }
-        };
+        // Object URL revocation logic is no longer needed here for TTS audio,
+        // as we are using base64 data URLs.
+        // The `revokeCurrentAudioObjectURL` helper and `managedObjectURL` dataset are not relevant for base64.
 
         if (this._currentlyPlayingTtsAudio && this._currentlyPlayingTtsButton === buttonElement) {
             if (this._currentlyPlayingTtsAudio.paused) {
@@ -291,13 +306,11 @@ const MessageTtsHandler = {
         } else {
             if (this._currentlyPlayingTtsAudio) {
                 this._currentlyPlayingTtsAudio.pause();
-                revokeCurrentAudioObjectURL(this._currentlyPlayingTtsAudio);
+                // No Object URL to revoke for base64
                 if (this._currentlyPlayingTtsButton) this._currentlyPlayingTtsButton.classList.remove('playing');
             }
-            this._currentlyPlayingTtsAudio = new Audio(audioUrl);
+            this._currentlyPlayingTtsAudio = new Audio(audioUrl); // Works with base64 Data URLs
             this._currentlyPlayingTtsButton = buttonElement;
-            // Mark object URLs for revocation
-            if (audioUrl.startsWith('blob:')) this._currentlyPlayingTtsAudio.dataset.managedObjectURL = 'true';
 
             this._currentlyPlayingTtsAudio.play().then(() => buttonElement.classList.add('playing'))
                 .catch(e => {
@@ -305,13 +318,13 @@ const MessageTtsHandler = {
                     buttonElement.classList.remove('playing');
                     buttonElement.innerHTML = '⚠️'; buttonElement.title = "初始化音频时出错";
                     setTimeout(() => { if (buttonElement.innerHTML === '⚠️') { buttonElement.innerHTML = ''; buttonElement.title = "播放/暂停语音"; } }, 2000);
-                    revokeCurrentAudioObjectURL(this._currentlyPlayingTtsAudio);
+                    // No Object URL to revoke
                     this._currentlyPlayingTtsAudio = null; this._currentlyPlayingTtsButton = null;
                 });
             this._currentlyPlayingTtsAudio.onended = () => {
                 buttonElement.classList.remove('playing');
                 if (this._currentlyPlayingTtsAudio && this._currentlyPlayingTtsButton === buttonElement) {
-                    revokeCurrentAudioObjectURL(this._currentlyPlayingTtsAudio);
+                    // No Object URL to revoke
                     this._currentlyPlayingTtsAudio = null; this._currentlyPlayingTtsButton = null;
                 }
             };
@@ -321,7 +334,7 @@ const MessageTtsHandler = {
                 buttonElement.innerHTML = '⚠️'; buttonElement.title = "播放音频时出错";
                 setTimeout(() => { if (buttonElement.innerHTML === '⚠️') { buttonElement.innerHTML = ''; buttonElement.title = "播放/暂停语音"; } }, 2000);
                 if (this._currentlyPlayingTtsAudio && this._currentlyPlayingTtsButton === buttonElement) {
-                    revokeCurrentAudioObjectURL(this._currentlyPlayingTtsAudio);
+                    // No Object URL to revoke
                     this._currentlyPlayingTtsAudio = null; this._currentlyPlayingTtsButton = null;
                 }
             };
